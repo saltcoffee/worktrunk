@@ -3,7 +3,7 @@
 //! Each [`TaskKind`] dispatches here to one private computation over a shared
 //! [`TaskContext`].
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
 use std::sync::Arc;
@@ -734,18 +734,13 @@ fn compute_url_status(ctx: &TaskContext) -> anyhow::Result<TaskResult> {
         });
     };
 
-    // Parse port from URL and check if it's listening
+    // Parse host and port from URL and check if the port is listening.
     // Skip health check in tests to avoid flaky results from random local processes
     let active = if std::env::var("WORKTRUNK_TEST_SKIP_URL_HEALTH_CHECK").is_ok() {
         Some(false)
     } else {
-        parse_port_from_url(url).map(|port| {
-            // Quick TCP connect check with 50ms timeout
-            let addr = SocketAddr::from(([127, 0, 0, 1], port));
-            worktrunk::shell_exec::stream_socket(socket2::Domain::IPV4)
-                .and_then(|socket| socket.connect_timeout(&addr.into(), Duration::from_millis(50)))
-                .is_ok()
-        })
+        parse_host_port_from_url(url)
+            .map(|(host, port)| url_probe_addrs(host, port).into_iter().any(probe_addr))
     };
 
     // Return only active status (url=None to avoid overwriting the already-sent URL)
@@ -794,16 +789,69 @@ fn first_line(s: &str) -> String {
         .to_string()
 }
 
-/// Parse port number from a URL string (e.g., "http://localhost:12345" -> 12345)
+/// Parse the port number from a URL string (e.g., "http://localhost:12345" -> 12345).
+///
+/// A missing scheme is tolerated, so a scheme-less `localhost:3000` still yields
+/// its port (and then collapses to `:3000` when rendered).
 pub(crate) fn parse_port_from_url(url: &str) -> Option<u16> {
-    // Strip scheme
+    parse_host_port_from_url(url).map(|(_host, port)| port)
+}
+
+/// Parse the host and port from a URL, tolerating a missing scheme.
+///
+/// Accepts `http(s)://host:port`, `host:port`, IPv6 literals (`[::1]:3000`),
+/// and ignores any path, query, fragment, or userinfo.
+fn parse_host_port_from_url(url: &str) -> Option<(&str, u16)> {
+    // Strip scheme (if present) and take the authority component.
     let url = url
         .strip_prefix("http://")
-        .or_else(|| url.strip_prefix("https://"))?;
-    // Extract host:port (before path, query, or fragment)
-    let host_port = url.split(&['/', '?', '#'][..]).next()?;
-    let (_host, port_str) = host_port.rsplit_once(':')?;
-    port_str.parse().ok()
+        .or_else(|| url.strip_prefix("https://"))
+        .unwrap_or(url);
+    let authority = url.split(['/', '?', '#']).next()?;
+    let authority = authority.rsplit('@').next()?;
+
+    // IPv6 literal: `[::1]:3000`.
+    if let Some(rest) = authority.strip_prefix('[') {
+        let (host, after) = rest.split_once(']')?;
+        let port = after.strip_prefix(':')?.parse().ok()?;
+        return Some((host, port));
+    }
+
+    let (host, port) = authority.rsplit_once(':')?;
+    let port = port.parse().ok()?;
+    Some((host, port))
+}
+
+/// Candidate socket addresses to probe for a dev-server URL.
+///
+/// The `[list] url` template names a local dev server, so a hostname (the
+/// default `localhost`, a `*.localhost` name, or any other name) is treated as
+/// a **local default assumption**: it is checked on both loopback families.
+/// A server bound only to `::1` — common on macOS, where `localhost` resolves
+/// to IPv6 first, and where some dev servers (Vite, Next) bind only `::1` —
+/// would otherwise look dead. We never resolve DNS here; a health check must
+/// not touch the network. An explicit IP literal in the URL is probed as given.
+fn url_probe_addrs(host: &str, port: u16) -> Vec<SocketAddr> {
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return vec![SocketAddr::new(ip, port)];
+    }
+    // IPv4 first to match the previous behaviour, then IPv6 loopback.
+    vec![
+        SocketAddr::from(([127, 0, 0, 1], port)),
+        SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), port),
+    ]
+}
+
+/// Quick TCP connect check with a 50ms timeout.
+fn probe_addr(addr: SocketAddr) -> bool {
+    let domain = if addr.is_ipv4() {
+        socket2::Domain::IPV4
+    } else {
+        socket2::Domain::IPV6
+    };
+    worktrunk::shell_exec::stream_socket(domain)
+        .and_then(|socket| socket.connect_timeout(&addr.into(), Duration::from_millis(50)))
+        .is_ok()
 }
 
 /// Parse git status output to extract working tree status and conflict state.
@@ -923,6 +971,74 @@ mod tests {
                 active: None,
             }
         ));
+    }
+
+    #[test]
+    fn parse_host_port_accepts_scheme_and_path() {
+        assert_eq!(
+            parse_host_port_from_url("http://localhost:3000/foo?x=1#frag"),
+            Some(("localhost", 3000))
+        );
+        assert_eq!(
+            parse_host_port_from_url("https://127.0.0.1:8443"),
+            Some(("127.0.0.1", 8443))
+        );
+    }
+
+    #[test]
+    fn parse_host_port_accepts_scheme_less_urls() {
+        assert_eq!(
+            parse_port_from_url("localhost:3000"),
+            Some(3000),
+            "a scheme-less URL should still collapse to its port"
+        );
+        assert_eq!(
+            parse_host_port_from_url("localhost:3000"),
+            Some(("localhost", 3000))
+        );
+    }
+
+    #[test]
+    fn parse_host_port_handles_ipv6_literals() {
+        assert_eq!(
+            parse_host_port_from_url("http://[::1]:3000"),
+            Some(("::1", 3000))
+        );
+        assert_eq!(parse_port_from_url("http://[::1]:3000"), Some(3000));
+    }
+
+    #[test]
+    fn parse_host_port_rejects_missing_port() {
+        assert_eq!(parse_port_from_url("http://localhost"), None);
+        assert_eq!(parse_port_from_url("http://localhost/foo"), None);
+    }
+
+    #[test]
+    fn probe_addrs_use_ip_literal_when_given() {
+        assert_eq!(
+            url_probe_addrs("127.0.0.1", 3000),
+            vec![SocketAddr::from(([127, 0, 0, 1], 3000))]
+        );
+        assert_eq!(
+            url_probe_addrs("::1", 3000),
+            vec![SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 3000)]
+        );
+    }
+
+    #[test]
+    fn probe_addrs_try_both_loopback_families_for_hostnames() {
+        assert_eq!(
+            url_probe_addrs("localhost", 3000),
+            vec![
+                SocketAddr::from(([127, 0, 0, 1], 3000)),
+                SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 3000),
+            ]
+        );
+        assert_eq!(
+            url_probe_addrs("main.localhost", 3000),
+            url_probe_addrs("localhost", 3000),
+            "a *.localhost host is still a local default assumption"
+        );
     }
 
     #[test]
